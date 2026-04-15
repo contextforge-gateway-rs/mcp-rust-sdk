@@ -1,17 +1,21 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     num::ParseIntError,
+    sync::Arc,
     time::Duration,
 };
 
+use async_trait::async_trait;
 use futures::Stream;
+use redis::{AsyncCommands, RedisError, cmd};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{
     mpsc::{Receiver, Sender},
     oneshot,
 };
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 
 use crate::{
     RoleServer,
@@ -28,16 +32,110 @@ use crate::{
     },
 };
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
+pub struct RedisSessionManager {
+    redis_client: redis::Client,
+}
+impl RedisSessionManager {
+    pub fn new(redis_client: redis::Client) -> Self {
+        Self { redis_client }
+    }
+}
+
+#[async_trait]
+pub trait SessionStore: Send + Sync {
+    async fn get_session<'a>(
+        &self,
+        key: Arc<str>,
+    ) -> Result<RemoteSessionConfig, RemoteSessionManagerError>;
+    async fn set_session<'a>(
+        &self,
+        key: Arc<str>,
+        user_config: &'a RemoteSessionConfig,
+    ) -> Result<(), RemoteSessionManagerError>;
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteSessionConfig {
+    pub id: String,
+    pub request: Option<ClientJsonRpcMessage>,
+}
+
+#[async_trait]
+impl SessionStore for RedisSessionManager {
+    async fn get_session<'a>(
+        &self,
+        key: Arc<str>,
+    ) -> Result<RemoteSessionConfig, RemoteSessionManagerError> {
+        let Ok(mut connection) = self.redis_client.get_multiplexed_async_connection().await else {
+            return Err(RemoteSessionManagerError::SessionNotFound(key));
+        };
+
+        let maybe_user_config: Result<Option<Vec<u8>>, RedisError> = cmd("GET")
+            .arg(&(*key))
+            .take()
+            .query_async(&mut connection)
+            .await;
+
+        let Ok(Some(user_config)) = maybe_user_config else {
+            return Err(RemoteSessionManagerError::SessionNotFound(key));
+        };
+
+        let Ok(user_config) = rmp_serde::decode::from_slice::<RemoteSessionConfig>(&user_config)
+        else {
+            return Err(RemoteSessionManagerError::SessionNotFound(key));
+        };
+
+        Ok(user_config)
+    }
+
+    async fn set_session<'a>(
+        &self,
+        key: Arc<str>,
+        config: &'a RemoteSessionConfig,
+    ) -> Result<(), RemoteSessionManagerError> {
+        let Ok(encoded) = rmp_serde::encode::to_vec::<RemoteSessionConfig>(config) else {
+            return Err(RemoteSessionManagerError::SessionNotFound(key));
+        };
+
+        let Ok(mut connection) = self.redis_client.get_multiplexed_async_connection().await else {
+            return Err(RemoteSessionManagerError::SessionNotFound(key));
+        };
+
+        let my_key: &str = &key;
+        if connection
+            .set::<&str, &[u8], String>(my_key, &encoded)
+            .await
+            .is_ok()
+        {
+            Ok(())
+        } else {
+            return Err(RemoteSessionManagerError::SessionNotFound(key));
+        }
+    }
+}
+
 #[non_exhaustive]
-pub struct LocalSessionManager {
+pub struct RemoteSessionManager {
     pub sessions: tokio::sync::RwLock<HashMap<SessionId, LocalSessionHandle>>,
+    pub remote_sessions: Arc<dyn SessionStore + Send + Sync>,
     pub session_config: SessionConfig,
+}
+
+impl RemoteSessionManager {
+    pub fn new(remote_sessions: Arc<dyn SessionStore + Send + Sync>) -> Self {
+        Self {
+            remote_sessions,
+            sessions: Default::default(),
+            session_config: Default::default(),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
-pub enum LocalSessionManagerError {
+pub enum RemoteSessionManagerError {
     #[error("Session not found: {0}")]
     SessionNotFound(SessionId),
     #[error("Session error: {0}")]
@@ -45,12 +143,22 @@ pub enum LocalSessionManagerError {
     #[error("Invalid event id: {0}")]
     InvalidEventId(#[from] EventIdParseError),
 }
-impl SessionManager for LocalSessionManager {
-    type Error = LocalSessionManagerError;
+impl SessionManager for RemoteSessionManager {
+    type Error = RemoteSessionManagerError;
     type Transport = WorkerTransport<LocalSessionWorker>;
     async fn create_session(&self) -> Result<(SessionId, Self::Transport), Self::Error> {
-        debug!(target = "LocalSessioManager", "Create session");
+        debug!(target = "RemoteSessionManager", "Create session");
         let id = session_id();
+        let remote_id = id.clone();
+        self.remote_sessions
+            .set_session(
+                remote_id,
+                &RemoteSessionConfig {
+                    id: (*id).to_owned(),
+                    request: None,
+                },
+            )
+            .await?;
         let (handle, worker) = create_local_session(id.clone(), self.session_config.clone());
         self.sessions.write().await.insert(id.clone(), handle);
         Ok((id, WorkerTransport::spawn(worker)))
@@ -60,16 +168,29 @@ impl SessionManager for LocalSessionManager {
         id: &SessionId,
         message: ClientJsonRpcMessage,
     ) -> Result<ServerJsonRpcMessage, Self::Error> {
-        debug!(target = "LocalSessioManager", "Initialize session {id:?}");
+        debug!(target = "RemoteSessionManager", "Initialize session {id:?}");
+
         let sessions = self.sessions.read().await;
         let handle = sessions
             .get(id)
-            .ok_or(LocalSessionManagerError::SessionNotFound(id.clone()))?;
-        let response = handle.initialize(message).await?;
+            .ok_or(RemoteSessionManagerError::SessionNotFound(id.clone()))?;
+
+        let remote_id = id.clone();
+        self.remote_sessions
+            .set_session(
+                remote_id,
+                &RemoteSessionConfig {
+                    id: id.to_string(),
+                    request: Some(message.clone()),
+                },
+            )
+            .await?;
+
+        let response = handle.initialize(message, false).await?;
         Ok(response)
     }
     async fn close_session(&self, id: &SessionId) -> Result<(), Self::Error> {
-        debug!(target = "LocalSessioManager", "Close session {id:?}");
+        debug!(target = "RemoteSessionManager", "Close session {id:?}");
         let mut sessions = self.sessions.write().await;
         if let Some(handle) = sessions.remove(id) {
             handle.close().await?;
@@ -89,9 +210,55 @@ impl SessionManager for LocalSessionManager {
         ),
         Self::Error,
     > {
-        debug!(target = "LocalSessioManager", "Has session {id:?}");
+        debug!(target = "RemoteSessionManager", "Has session {id:?}");
+
+        //TODO:: re-create session if necessary ?
+        //
         let sessions = self.sessions.read().await;
-        Ok((sessions.contains_key(id), None))
+        let has_key = { sessions.contains_key(id) };
+        drop(sessions);
+        if has_key {
+            Ok((has_key, None))
+        } else {
+            debug!(
+                target = "RemoteSessionManager",
+                "We don't have a local session yet... for {id}"
+            );
+            let remote_id = id.clone();
+            let remote_session_config = self.remote_sessions.get_session(remote_id).await?;
+            if remote_session_config.id == **id
+                && let Some(initialize_request) = remote_session_config.request
+            {
+                debug!(
+                    target = "RemoteSessionManager",
+                    "Matching session found in redis for {id}"
+                );
+
+                let (handle, worker) =
+                    create_local_session(id.clone(), self.session_config.clone());
+                debug!(
+                    target = "RemoteSessionManager",
+                    "Created local session id for {id}"
+                );
+                self.sessions.write().await.insert(id.clone(), handle);
+
+                let worker = WorkerTransport::spawn(worker);
+                Ok((true, Some((worker, initialize_request))))
+                //let maybe_initialized = handle.initialize(initialize_request, true).await;
+                // if maybe_initialized.is_ok() {
+                //     debug!(target = "RemoteSessionManager", "Returning");
+                //     Ok((true, Some(worker)))
+                // } else {
+                //     warn!(
+                //         target = "RemoteSessionManager",
+                //         "Couldn't initialize {maybe_initialized:?}"
+                //     );
+                //     Ok((false, None))
+                // }
+            } else {
+                Ok((false, None))
+            }
+        }
     }
     async fn create_stream(
         &self,
@@ -99,13 +266,13 @@ impl SessionManager for LocalSessionManager {
         message: ClientJsonRpcMessage,
     ) -> Result<impl Stream<Item = ServerSseMessage> + Send + 'static, Self::Error> {
         debug!(
-            target = "LocalSessioManager",
+            target = "RemoteSessionManager",
             "Has session {id:?} {message:?}"
         );
         let sessions = self.sessions.read().await;
         let handle = sessions
             .get(id)
-            .ok_or(LocalSessionManagerError::SessionNotFound(id.clone()))?;
+            .ok_or(RemoteSessionManagerError::SessionNotFound(id.clone()))?;
         let receiver = handle.establish_request_wise_channel().await?;
         handle
             .push_message(message, receiver.http_request_id)
@@ -118,13 +285,13 @@ impl SessionManager for LocalSessionManager {
         id: &SessionId,
     ) -> Result<impl Stream<Item = ServerSseMessage> + Send + 'static, Self::Error> {
         debug!(
-            target = "LocalSessioManager",
+            target = "RemoteSessionManager",
             "create_standalone_stream  {id:?}"
         );
         let sessions = self.sessions.read().await;
         let handle = sessions
             .get(id)
-            .ok_or(LocalSessionManagerError::SessionNotFound(id.clone()))?;
+            .ok_or(RemoteSessionManagerError::SessionNotFound(id.clone()))?;
         let receiver = handle.establish_common_channel().await?;
         Ok(ReceiverStream::new(receiver.inner))
     }
@@ -135,13 +302,13 @@ impl SessionManager for LocalSessionManager {
         last_event_id: String,
     ) -> Result<impl Stream<Item = ServerSseMessage> + Send + 'static, Self::Error> {
         debug!(
-            target = "LocalSessioManager",
+            target = "RemoteSessionManager",
             "resume {id:?} {last_event_id}"
         );
         let sessions = self.sessions.read().await;
         let handle = sessions
             .get(id)
-            .ok_or(LocalSessionManagerError::SessionNotFound(id.clone()))?;
+            .ok_or(RemoteSessionManagerError::SessionNotFound(id.clone()))?;
         let receiver = handle.resume(last_event_id.parse()?).await?;
         Ok(ReceiverStream::new(receiver.inner))
     }
@@ -152,14 +319,14 @@ impl SessionManager for LocalSessionManager {
         message: ClientJsonRpcMessage,
     ) -> Result<(), Self::Error> {
         debug!(
-            target = "LocalSessioManager",
+            target = "RemoteSessionManager",
             "accept_message {id:?} {message:?}"
         );
 
         let sessions = self.sessions.read().await;
         let handle = sessions
             .get(id)
-            .ok_or(LocalSessionManagerError::SessionNotFound(id.clone()))?;
+            .ok_or(RemoteSessionManagerError::SessionNotFound(id.clone()))?;
         handle.push_message(message, None).await?;
         Ok(())
     }
@@ -715,7 +882,9 @@ pub enum SessionEvent {
     InitializeRequest {
         request: ClientJsonRpcMessage,
         responder: oneshot::Sender<Result<ServerJsonRpcMessage, SessionError>>,
+        cloned: bool,
     },
+
     Close,
     CloseSseStream {
         /// The HTTP request ID to close. If `None`, closes the standalone (common) stream.
@@ -848,12 +1017,14 @@ impl LocalSessionHandle {
     pub async fn initialize(
         &self,
         request: ClientJsonRpcMessage,
+        cloned: bool,
     ) -> Result<ServerJsonRpcMessage, SessionError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.event_tx
             .send(SessionEvent::InitializeRequest {
                 request,
                 responder: tx,
+                cloned,
             })
             .await
             .map_err(|_| SessionError::SessionServiceTerminated)?;
@@ -968,12 +1139,18 @@ impl Worker for LocalSessionWorker {
                 "get initialize request",
             )
         })?;
-        let SessionEvent::InitializeRequest { request, responder } = evt else {
+        let SessionEvent::InitializeRequest {
+            request,
+            responder,
+            cloned,
+        } = evt
+        else {
             return Err(WorkerQuitReason::fatal(
                 LocalSessionWorkerError::UnexpectedEvent(evt),
                 "get initialize request",
             ));
         };
+
         context.send_to_handler(request).await?;
         let send_initialize_response = context.recv_from_handler().await?;
         responder
@@ -986,12 +1163,24 @@ impl Worker for LocalSessionWorker {
                     "send initialize response",
                 )
             })?;
+
         send_initialize_response
             .responder
             .send(Ok(()))
             .map_err(|_| WorkerQuitReason::HandlerTerminated)?;
+
         let ct = context.cancellation_token.clone();
         let keep_alive = self.session_config.keep_alive.unwrap_or(Duration::MAX);
+
+        debug!(target = "RemoteSessionManager", "Starting the loop ");
+
+        if cloned {
+            debug!(
+                target = "RemoteSessionManager",
+                "Cloned session so skipping the response"
+            );
+        }
+
         loop {
             let keep_alive_timeout = tokio::time::sleep(keep_alive);
             let event = tokio::select! {

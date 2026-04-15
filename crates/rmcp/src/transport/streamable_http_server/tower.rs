@@ -1,5 +1,6 @@
 use std::{convert::Infallible, fmt::Display, sync::Arc, time::Duration};
 
+
 use bytes::Bytes;
 use futures::{StreamExt, future::BoxFuture};
 use http::{HeaderMap, Method, Request, Response, header::ALLOW};
@@ -28,7 +29,6 @@ use crate::{
         },
     },
 };
-
 
 #[derive(Debug, Clone)]
 pub struct NewSessionId {
@@ -468,7 +468,7 @@ where
                 .expect("valid response"));
         };
         // check if session exists
-        let has_session = self
+        let (has_session, maybe_transport) = self
             .session_manager
             .has_session(&session_id)
             .await
@@ -480,6 +480,38 @@ where
                 .body(Full::new(Bytes::from("Not Found: Session not found")).boxed())
                 .expect("valid response"));
         }
+
+        let service = self
+            .get_service()
+            .map_err(internal_error_response("get service"))?;
+        if let Some((transport, _)) = maybe_transport {
+            tokio::spawn({
+                let session_manager = self.session_manager.clone();
+                let session_id = session_id.clone();
+                async move {
+                    let service = serve_server::<S, M::Transport, _, TransportAdapterIdentity>(
+                        service, transport,
+                    )
+                    .await;
+                    match service {
+                        Ok(service) => {
+                            // on service created
+                            let _ = service.waiting().await;
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to create service: {e}");
+                        }
+                    }
+                    let _ = session_manager
+                        .close_session(&session_id)
+                        .await
+                        .inspect_err(|e| {
+                            tracing::error!("Failed to close session {session_id}: {e}");
+                        });
+                }
+            });
+        }
+
         // Validate MCP-Protocol-Version header (per 2025-06-18 spec)
         validate_protocol_version_header(request.headers())?;
         // check if last event id is provided
@@ -580,17 +612,69 @@ where
                 .and_then(|v| v.to_str().ok());
             if let Some(session_id) = session_id {
                 let session_id = session_id.to_owned().into();
-                let has_session = self
+                let (has_session, maybe_transport) = self
                     .session_manager
                     .has_session(&session_id)
                     .await
                     .map_err(internal_error_response("check session"))?;
+
                 if !has_session {
                     // MCP spec: server MUST respond with 404 Not Found for terminated/unknown sessions
                     return Ok(Response::builder()
                         .status(http::StatusCode::NOT_FOUND)
                         .body(Full::new(Bytes::from("Not Found: Session not found")).boxed())
                         .expect("valid response"));
+                }
+
+                let service = self
+                    .get_service()
+                    .map_err(internal_error_response("get service"))?;
+                if let Some((transport, mut initial_request)) = maybe_transport {
+                    tokio::spawn({
+                        let session_manager = self.session_manager.clone();
+                        let session_id = session_id.clone();
+                        async move {
+                            let service =
+                                serve_server::<S, M::Transport, _, TransportAdapterIdentity>(
+                                    service, transport,
+                                )
+                                .await;
+                            match service {
+                                Ok(service) => {
+                                    // on service created
+                                    let _ = service.waiting().await;
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to create service: {e}");
+                                }
+                            }
+                            let _ = session_manager
+                                .close_session(&session_id)
+                                .await
+                                .inspect_err(|e| {
+                                    tracing::error!("Failed to close session {session_id}: {e}");
+                                });
+                        }
+                    });
+
+                    initial_request.insert_extension(NewSessionId {
+                            session_id: session_id.clone(),
+                    });
+                    
+                    initial_request.insert_extension(part.clone());
+
+                    
+                    
+
+                    let initialization_response = self
+                        .session_manager
+                        .initialize_session(&session_id, initial_request)
+                        .await
+                        .map_err(internal_error_response("create stream"));
+                    tracing::debug!(
+                        "Got re-initialization response {:?}",
+                        initialization_response
+                    );
                 }
 
                 // Validate MCP-Protocol-Version header (per 2025-06-18 spec)

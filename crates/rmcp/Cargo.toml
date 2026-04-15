@@ -98,7 +98,8 @@ bytes = { version = "1", optional = true }
 # for unix socket transport
 hyper = { version = "1", features = ["client", "http1"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
-
+redis = {version="1.1.0", features=["default","tokio-rustls-comp"]}
+rmp-serde = "1.3.1"
 # macro
 rmcp-macros = { workspace = true, optional = true }
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
@@ -331,11 +332,10 @@ path = "tests/test_unix_socket_transport.rs"
 [[test]]
 name = "test_streamable_http_stale_session"
 required-features = [
-  "server", 
-  "client", 
-  "transport-streamable-http-server", 
-  "transport-streamable-http-client", 
+  "server",
+  "client",
+  "transport-streamable-http-server",
+  "transport-streamable-http-client",
   "transport-streamable-http-client-reqwest"
 ]
 path = "tests/test_streamable_http_stale_session.rs"
-

@@ -25,11 +25,15 @@ use futures::Stream;
 pub use crate::transport::common::server_side_http::{ServerSseMessage, SessionId};
 use crate::{
     RoleServer,
-    model::{ClientJsonRpcMessage, ServerJsonRpcMessage},
+    model::{
+        ClientJsonRpcMessage, ClientNotification, ClientRequest, ClientResult, JsonRpcMessage,
+        ServerJsonRpcMessage,
+    },
 };
 
 pub mod local;
 pub mod never;
+pub mod remote;
 
 /// Controls how MCP sessions are created, validated, and closed.
 ///
@@ -55,8 +59,21 @@ pub trait SessionManager: Send + Sync + 'static {
     ) -> impl Future<Output = Result<ServerJsonRpcMessage, Self::Error>> + Send;
 
     /// Return `true` if a session with the given ID exists and is active.
-    fn has_session(&self, id: &SessionId)
-    -> impl Future<Output = Result<bool, Self::Error>> + Send;
+    fn has_session(
+        &self,
+        id: &SessionId,
+    ) -> impl Future<
+        Output = Result<
+            (
+                bool,
+                Option<(
+                    Self::Transport,
+                    JsonRpcMessage<ClientRequest, ClientResult, ClientNotification>,
+                )>,
+            ),
+            Self::Error,
+        >,
+    > + Send;
 
     /// Close and remove the session. Corresponds to an HTTP DELETE request
     /// with `Mcp-Session-Id`.

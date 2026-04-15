@@ -4,7 +4,10 @@ use thiserror::Error;
 use super::{ServerSseMessage, SessionId, SessionManager};
 use crate::{
     RoleServer,
-    model::{ClientJsonRpcMessage, ServerJsonRpcMessage},
+    model::{
+        ClientJsonRpcMessage, ClientNotification, ClientRequest, ClientResult, JsonRpcMessage,
+        ServerJsonRpcMessage,
+    },
     transport::Transport,
 };
 
@@ -57,7 +60,18 @@ impl SessionManager for NeverSessionManager {
     fn has_session(
         &self,
         _id: &SessionId,
-    ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
+    ) -> impl Future<
+        Output = Result<
+            (
+                bool,
+                Option<(
+                    Self::Transport,
+                    JsonRpcMessage<ClientRequest, ClientResult, ClientNotification>,
+                )>,
+            ),
+            Self::Error,
+        >,
+    > + Send {
         futures::future::ready(Err(ErrorSessionManagementNotSupported))
     }
 
