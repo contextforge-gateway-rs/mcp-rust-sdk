@@ -31,14 +31,16 @@ use crate::{
 };
 
 #[derive(Debug, Clone)]
-pub struct NewSessionId {
+pub struct DownstreamSessionId {
     pub session_id: Arc<str>,
 }
-impl NewSessionId {
+impl DownstreamSessionId {
     pub fn value(&self) -> &str {
         &self.session_id
     }
 }
+
+
 
 #[non_exhaustive]
 #[derive(Debug, Clone)]
@@ -657,7 +659,7 @@ where
                         }
                     });
 
-                    initial_request.insert_extension(NewSessionId {
+                    initial_request.insert_extension(DownstreamSessionId {
                             session_id: session_id.clone(),
                     });
                     
@@ -739,7 +741,7 @@ where
                     // inject request part to extensions
 
                     req.request.extensions_mut().insert(part);
-                    req.request.extensions_mut().insert(NewSessionId {
+                    req.request.extensions_mut().insert(DownstreamSessionId {
                         session_id: session_id.clone(),
                     });
                 } else {
