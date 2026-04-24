@@ -7,10 +7,12 @@ use std::{
 
 use async_trait::async_trait;
 use futures::Stream;
+use lru_cache::LruCache;
 use redis::{AsyncCommands, RedisError, cmd};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{
+    Mutex,
     mpsc::{Receiver, Sender},
     oneshot,
 };
@@ -35,10 +37,14 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct RedisSessionStore {
     redis_client: redis::Client,
+    cache: Arc<Mutex<LruCache<RemoteSessionKey, RemoteSessionConfig>>>,
 }
 impl RedisSessionStore {
     pub fn new(redis_client: redis::Client) -> Self {
-        Self { redis_client }
+        Self {
+            redis_client,
+            cache: Arc::new(Mutex::new(LruCache::new(50_000))),
+        }
     }
 }
 
@@ -62,7 +68,7 @@ pub struct RemoteSessionConfig {
     pub request: Option<ClientJsonRpcMessage>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 
 pub struct RemoteSessionKey {
     name: &'static str,
@@ -82,43 +88,57 @@ impl RemoteSessionKey {
 impl SessionStore for RedisSessionStore {
     async fn get_session<'a>(
         &self,
-        key: &'a RemoteSessionKey,
+        session_key: &'a RemoteSessionKey,
     ) -> Result<Option<RemoteSessionConfig>, RemoteSessionManagerError> {
-        let session_id = key.session_id.clone();
-        let Ok(key) = rmp_serde::encode::to_vec::<RemoteSessionKey>(key) else {
-            return Err(RemoteSessionManagerError::SessionNotFound(session_id));
-        };
+        let session_id = session_key.session_id.clone();
+        let has_key = { self.cache.lock().await.contains_key(session_key) };
+        if !has_key {
+            let Ok(key) = rmp_serde::encode::to_vec::<RemoteSessionKey>(session_key) else {
+                return Err(RemoteSessionManagerError::SessionNotFound(session_id));
+            };
 
-        let Ok(mut connection) = self.redis_client.get_multiplexed_async_connection().await else {
-            return Err(RemoteSessionManagerError::SessionNotFound(session_id));
-        };
+            let Ok(mut connection) = self.redis_client.get_multiplexed_async_connection().await
+            else {
+                return Err(RemoteSessionManagerError::SessionNotFound(session_id));
+            };
 
-        let maybe_remote_session_config: Result<Option<Vec<u8>>, RedisError> = cmd("GET")
-            .arg(key)
-            .take()
-            .query_async(&mut connection)
-            .await;
+            let maybe_remote_session_config: Result<Option<Vec<u8>>, RedisError> = cmd("GET")
+                .arg(key)
+                .take()
+                .query_async(&mut connection)
+                .await;
 
-        let Ok(Some(remote_session_config)) = maybe_remote_session_config else {
-            return Ok(None);
-        };
+            let Ok(Some(remote_session_config)) = maybe_remote_session_config else {
+                return Ok(None);
+            };
 
-        let Ok(remote_session_config) =
-            rmp_serde::decode::from_slice::<RemoteSessionConfig>(&remote_session_config)
-        else {
-            return Err(RemoteSessionManagerError::SessionNotFound(session_id));
-        };
+            let Ok(remote_session_config) =
+                rmp_serde::decode::from_slice::<RemoteSessionConfig>(&remote_session_config)
+            else {
+                return Err(RemoteSessionManagerError::SessionNotFound(session_id));
+            };
 
-        Ok(Some(remote_session_config))
+            self.cache
+                .lock()
+                .await
+                .insert(session_key.clone(), remote_session_config.clone());
+            Ok(Some(remote_session_config))
+        } else {
+            if let Some(user_session) = self.cache.lock().await.get_mut(session_key) {
+                Ok(Some(user_session.clone()))
+            } else {
+                Ok(None)
+            }
+        }
     }
 
     async fn set_session<'a>(
         &self,
-        key: &'a RemoteSessionKey,
+        session_key: &'a RemoteSessionKey,
         config: &'a RemoteSessionConfig,
     ) -> Result<(), RemoteSessionManagerError> {
-        let session_id = key.session_id.clone();
-        let Ok(key) = rmp_serde::encode::to_vec::<RemoteSessionKey>(key) else {
+        let session_id = session_key.session_id.clone();
+        let Ok(key) = rmp_serde::encode::to_vec::<RemoteSessionKey>(session_key) else {
             return Err(RemoteSessionManagerError::SessionNotFound(session_id));
         };
         let Ok(encoded) = rmp_serde::encode::to_vec::<RemoteSessionConfig>(config) else {
@@ -134,6 +154,10 @@ impl SessionStore for RedisSessionStore {
             .await
             .is_ok()
         {
+            self.cache
+                .lock()
+                .await
+                .insert(session_key.clone(), config.clone());
             Ok(())
         } else {
             return Err(RemoteSessionManagerError::SessionNotFound(session_id));

@@ -1,6 +1,5 @@
 use std::{convert::Infallible, fmt::Display, sync::Arc, time::Duration};
 
-
 use bytes::Bytes;
 use futures::{StreamExt, future::BoxFuture};
 use http::{HeaderMap, Method, Request, Response, header::ALLOW};
@@ -8,6 +7,7 @@ use http_body::Body;
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
+use tracing::info;
 
 use super::session::SessionManager;
 use crate::{
@@ -39,8 +39,6 @@ impl DownstreamSessionId {
         &self.session_id
     }
 }
-
-
 
 #[non_exhaustive]
 #[derive(Debug, Clone)]
@@ -659,14 +657,15 @@ where
                         }
                     });
 
+                    info!(
+                        "Inserting downstream session id {} ",
+                        self.config.stateful_mode
+                    );
                     initial_request.insert_extension(DownstreamSessionId {
-                            session_id: session_id.clone(),
+                        session_id: session_id.clone(),
                     });
-                    
-                    initial_request.insert_extension(part.clone());
 
-                    
-                    
+                    initial_request.insert_extension(part.clone());
 
                     let initialization_response = self
                         .session_manager
@@ -740,6 +739,7 @@ where
                     }
                     // inject request part to extensions
 
+                    info!("Injecting downstream session id");
                     req.request.extensions_mut().insert(part);
                     req.request.extensions_mut().insert(DownstreamSessionId {
                         session_id: session_id.clone(),

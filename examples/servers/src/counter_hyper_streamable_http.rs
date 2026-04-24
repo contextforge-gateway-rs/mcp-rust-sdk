@@ -16,7 +16,7 @@ async fn main() -> anyhow::Result<()> {
         LocalSessionManager::default().into(),
         Default::default(),
     ));
-    let listener = tokio::net::TcpListener::bind("[::1]:8080").await?;
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:5555").await?;
     loop {
         let io = tokio::select! {
             _ = tokio::signal::ctrl_c() => break,

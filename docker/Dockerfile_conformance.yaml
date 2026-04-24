@@ -1,0 +1,36 @@
+
+FROM rust:1.91.1 AS builder
+
+RUN <<EOF
+apt update
+apt install -y git ca-certificates git
+git clone --depth 1 https://github.com/modelcontextprotocol/rust-sdk.git
+EOF
+
+WORKDIR /rust-sdk/conformance
+
+RUN \
+    --mount=type=cache,id=cargo,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
+    cargo fetch 
+RUN \
+    --mount=type=cache,id=cargo,target=/usr/local/cargo/registry  \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
+    cargo build --release
+
+
+FROM debian:trixie
+RUN <<EOF
+apt update
+apt upgrade -y
+apt install -y python3
+EOF
+
+WORKDIR /
+COPY --from=builder /rust-sdk/target/release/conformance-server /conformance-server
+COPY --from=builder /rust-sdk/target/release/conformance-client /conformance-client
+LABEL org.opencontainers.image.source=https://github.com/mcp-gateway-rs/mcp-gateway-rs
+LABEL org.opencontainers.image.description="MCP Conformance servers and clients "
+ENV RUST_LOG=debug
+ENTRYPOINT ["/conformance-server"]
+

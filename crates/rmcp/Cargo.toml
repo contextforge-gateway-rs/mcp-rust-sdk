@@ -83,6 +83,7 @@ process-wrap = { version = "9.0", features = ["tokio1"], optional = true }
 
 # for cross-platform executable path resolution
 which = { version = "7", optional = true }
+lru-cache = "0.1.2"
 
 # for ws transport
 # tokio-tungstenite ={ version = "0.26", optional = true }
@@ -98,7 +99,7 @@ bytes = { version = "1", optional = true }
 # for unix socket transport
 hyper = { version = "1", features = ["client", "http1"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
-redis = {version="1.1.0", features=["default","tokio-rustls-comp"]}
+redis = { version = "1.1.0", features = ["default", "tokio-rustls-comp"] }
 rmp-serde = "1.3.1"
 # macro
 rmcp-macros = { workspace = true, optional = true }
@@ -149,7 +150,10 @@ client-side-sse = ["dep:sse-stream", "dep:http"]
 
 # Streamable HTTP client
 transport-streamable-http-client = ["client-side-sse", "transport-worker"]
-transport-streamable-http-client-reqwest = ["transport-streamable-http-client", "__reqwest"]
+transport-streamable-http-client-reqwest = [
+  "transport-streamable-http-client",
+  "__reqwest",
+]
 transport-streamable-http-client-unix-socket = [
   "transport-streamable-http-client",
   "dep:hyper",
@@ -167,10 +171,7 @@ transport-child-process = [
   "tokio/process",
   "dep:process-wrap",
 ]
-which-command = [
-  "transport-child-process",
-  "dep:which",
-]
+which-command = ["transport-child-process", "dep:which"]
 transport-streamable-http-server = [
   "transport-streamable-http-server-session",
   "server-side-http",
@@ -189,7 +190,10 @@ schemars = ["dep:schemars"]
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 schemars = { version = "1.1.0", features = ["chrono04"] }
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+axum = { version = "0.8", default-features = false, features = [
+  "http1",
+  "tokio",
+] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tower-service = "0.3"
@@ -208,12 +212,7 @@ path = "tests/test_tool_macros.rs"
 
 [[test]]
 name = "test_with_python"
-required-features = [
-  "reqwest",
-  "server",
-  "client",
-  "transport-child-process",
-]
+required-features = ["reqwest", "server", "client", "transport-child-process"]
 path = "tests/test_with_python.rs"
 
 [[test]]
@@ -265,17 +264,30 @@ path = "tests/test_task.rs"
 
 [[test]]
 name = "test_streamable_http_priming"
-required-features = ["server", "client", "transport-streamable-http-server", "reqwest"]
+required-features = [
+  "server",
+  "client",
+  "transport-streamable-http-server",
+  "reqwest",
+]
 path = "tests/test_streamable_http_priming.rs"
 
 [[test]]
 name = "test_streamable_http_json_response"
-required-features = ["server", "client", "transport-streamable-http-server", "reqwest"]
+required-features = [
+  "server",
+  "client",
+  "transport-streamable-http-server",
+  "reqwest",
+]
 path = "tests/test_streamable_http_json_response.rs"
 
 [[test]]
 name = "test_streamable_http_4xx_error_body"
-required-features = ["transport-streamable-http-client", "transport-streamable-http-client-reqwest"]
+required-features = [
+  "transport-streamable-http-client",
+  "transport-streamable-http-client-reqwest",
+]
 path = "tests/test_streamable_http_4xx_error_body.rs"
 
 
@@ -312,7 +324,13 @@ path = "tests/test_custom_headers.rs"
 
 [[test]]
 name = "test_sse_concurrent_streams"
-required-features = ["server", "client", "transport-streamable-http-server", "transport-streamable-http-client", "reqwest"]
+required-features = [
+  "server",
+  "client",
+  "transport-streamable-http-server",
+  "transport-streamable-http-client",
+  "reqwest",
+]
 path = "tests/test_sse_concurrent_streams.rs"
 
 [[test]]
@@ -336,6 +354,6 @@ required-features = [
   "client",
   "transport-streamable-http-server",
   "transport-streamable-http-client",
-  "transport-streamable-http-client-reqwest"
+  "transport-streamable-http-client-reqwest",
 ]
 path = "tests/test_streamable_http_stale_session.rs"
