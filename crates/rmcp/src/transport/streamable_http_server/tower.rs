@@ -7,6 +7,7 @@ use http_body::Body;
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
+use tracing::info;
 
 use super::session::{
     RestoreOutcome, SessionId, SessionManager, SessionRestoreMarker, SessionState, SessionStore,
@@ -33,6 +34,16 @@ use crate::{
         },
     },
 };
+
+#[derive(Debug, Clone)]
+pub struct DownstreamSessionId {
+    pub session_id: Arc<str>,
+}
+impl DownstreamSessionId {
+    pub fn value(&self) -> &str {
+        &self.session_id
+    }
+}
 
 #[non_exhaustive]
 #[derive(Debug, Clone)]
@@ -1063,7 +1074,11 @@ where
                         return Err(unexpected_message_response("initialize request"));
                     }
                     // inject request part to extensions
+                    info!("Injecting downstream session id");
                     req.request.extensions_mut().insert(part);
+                    req.request.extensions_mut().insert(DownstreamSessionId {
+                        session_id: session_id.clone(),
+                    });
                 } else {
                     return Err(unexpected_message_response("initialize request"));
                 }
