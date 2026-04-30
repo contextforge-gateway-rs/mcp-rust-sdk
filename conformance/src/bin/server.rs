@@ -814,7 +814,7 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8001);
 
-    let bind_addr = format!("127.0.0.1:{}", port);
+    let bind_addr = format!("0.0.0.0:{}", port);
     tracing::info!("Starting conformance server on {}", bind_addr);
 
     let server = ConformanceServer::new();
