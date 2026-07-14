@@ -1243,20 +1243,21 @@ where
                             init_req.params.protocol_version.as_str(),
                             Some(req.id.clone()),
                         )?;
-                        let stored_init_params = self
-                            .config
+                        self.config
                             .session_store
                             .as_ref()
-                            .map(|_| init_req.params.clone());
-                        // inject request part to extensions
-                        req.request.extensions_mut().insert(part);
-                        stored_init_params
+                            .map(|_| init_req.params.clone())
                     }
                     _ => {
                         return Err(unexpected_message_response("initialize request"));
                     }
                 };
 
+                let (session_id, transport) = self
+                    .session_manager
+                    .create_session()
+                    .await
+                    .map_err(internal_error_response("create session"))?;
                 if let ClientJsonRpcMessage::Request(req) = &mut message {
                     if !matches!(req.request, ClientRequest::InitializeRequest(_)) {
                         return Err(unexpected_message_response("initialize request"));
