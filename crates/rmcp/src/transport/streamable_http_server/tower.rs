@@ -42,21 +42,16 @@ use crate::{
             mcp_headers,
             server_side_http::{
                 BoxResponse, ServerSseMessage, accepted_response, expect_json,
-                internal_error_response, session_id, sse_stream_response,
-                unexpected_message_response,
+                internal_error_response, sse_stream_response, unexpected_message_response,
             },
         },
     },
 };
 
-/// Downstream compatibility identifier exposed to initialize handlers.
-///
-/// In legacy session mode this is the RMCP session identifier. For modern
-/// stateless requests it is a routing-only identifier and does not create
-/// server-side RMCP session state.
+/// Legacy downstream session identifier exposed to initialize handlers.
 #[derive(Debug, Clone)]
 pub struct DownstreamSessionId {
-    /// Identifier returned to the downstream client in `Mcp-Session-Id`.
+    /// RMCP session identifier returned in `Mcp-Session-Id`.
     pub session_id: Arc<str>,
 }
 
@@ -65,24 +60,6 @@ impl DownstreamSessionId {
     pub fn value(&self) -> &str {
         &self.session_id
     }
-}
-
-fn attach_downstream_session_id(
-    mut response: BoxResponse,
-    downstream_session_id: Option<&DownstreamSessionId>,
-) -> Result<BoxResponse, BoxResponse> {
-    if let Some(downstream_session_id) = downstream_session_id {
-        response.headers_mut().insert(
-            HEADER_SESSION_ID,
-            downstream_session_id
-                .value()
-                .parse()
-                .map_err(internal_error_response(
-                    "create downstream session id header",
-                ))?,
-        );
-    }
-    Ok(response)
 }
 
 /// Default maximum POST request body size (4 MiB).
@@ -1810,28 +1787,12 @@ where
                 .map_err(internal_error_response("get service"))?;
             match message {
                 ClientJsonRpcMessage::Request(mut request) => {
-                    let downstream_session_id =
-                        matches!(&request.request, ClientRequest::InitializeRequest(_)).then(
-                            || DownstreamSessionId {
-                                session_id: session_id(),
-                            },
-                        );
-                    if let Some(downstream_session_id) = downstream_session_id.clone() {
-                        request
-                            .request
-                            .extensions_mut()
-                            .insert(downstream_session_id);
-                    }
                     let negotiates_per_request = has_per_request_version
                         || matches!(&request.request, ClientRequest::DiscoverRequest(_));
                     if negotiates_per_request {
-                        let response = self
+                        return self
                             .serve_negotiated_request_directly(service, request, part)
-                            .await?;
-                        return attach_downstream_session_id(
-                            response,
-                            downstream_session_id.as_ref(),
-                        );
+                            .await;
                     }
                     // Build a peer_info so context.protocol_version() works inside handlers.
                     // serve_directly skips the handshake and receives None by default, making
@@ -1853,7 +1814,7 @@ where
                         // on service created
                         let _ = service.waiting().await;
                     });
-                    let response = if self.config.json_response {
+                    if self.config.json_response {
                         // Prefer JSON for a terminal first message. If the handler
                         // emits an intermediate notification or request, preserve
                         // the complete message sequence by falling back to SSE.
@@ -1888,18 +1849,17 @@ where
                             let body = serde_json::to_vec(&message).map_err(|e| {
                                 internal_error_response("serialize json response")(e)
                             })?;
-                            Response::builder()
+                            Ok(Response::builder()
                                 .status(http::StatusCode::OK)
                                 .header(http::header::CONTENT_TYPE, JSON_MIME_TYPE)
                                 .body(Full::new(Bytes::from(body)).boxed())
-                                .expect("valid response")
+                                .expect("valid response"))
                         } else {
-                            self.stateless_sse_response(Some(message), receiver, request_ct)
+                            Ok(self.stateless_sse_response(Some(message), receiver, request_ct))
                         }
                     } else {
-                        self.stateless_sse_response(None, receiver, request_ct)
-                    };
-                    attach_downstream_session_id(response, downstream_session_id.as_ref())
+                        Ok(self.stateless_sse_response(None, receiver, request_ct))
+                    }
                 }
                 ClientJsonRpcMessage::Notification(_notification) => {
                     // ignore
