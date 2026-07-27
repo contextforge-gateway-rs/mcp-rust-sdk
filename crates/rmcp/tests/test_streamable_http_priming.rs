@@ -43,7 +43,7 @@ impl ServerHandler for SessionIdRecorder {
 }
 
 #[tokio::test]
-async fn initialize_propagates_generated_session_id_to_handler() -> anyhow::Result<()> {
+async fn legacy_initialize_propagates_generated_session_id_to_handler() -> anyhow::Result<()> {
     let ct = CancellationToken::new();
     let recorder = SessionIdRecorder::default();
     let observed_session_id = Arc::clone(&recorder.session_id);
@@ -95,7 +95,7 @@ async fn initialize_propagates_generated_session_id_to_handler() -> anyhow::Resu
 async fn test_priming_on_stream_start() -> anyhow::Result<()> {
     let ct = CancellationToken::new();
 
-    // stateful_mode: true automatically enables priming with DEFAULT_RETRY_INTERVAL (3 seconds)
+    // legacy_session_mode: true automatically enables priming with DEFAULT_RETRY_INTERVAL (3 seconds)
     let service: StreamableHttpService<Calculator, LocalSessionManager> =
         StreamableHttpService::new(
             || Ok(Calculator::new()),
@@ -497,7 +497,7 @@ async fn test_priming_on_stream_close() -> anyhow::Result<()> {
     let ct = CancellationToken::new();
     let session_manager = Arc::new(LocalSessionManager::default());
 
-    // stateful_mode: true automatically enables priming with DEFAULT_RETRY_INTERVAL (3 seconds)
+    // legacy_session_mode: true automatically enables priming with DEFAULT_RETRY_INTERVAL (3 seconds)
     let service = StreamableHttpService::new(
         || Ok(Calculator::new()),
         session_manager.clone(),

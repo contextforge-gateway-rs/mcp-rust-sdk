@@ -550,10 +550,10 @@ where
     }
 
     fn notify_if_visible(&self, name: &str) {
-        if self.map.contains_key(name) {
-            if let Some(notifier) = &self.notifier {
-                notifier();
-            }
+        if self.map.contains_key(name)
+            && let Some(notifier) = &self.notifier
+        {
+            notifier();
         }
     }
 
@@ -667,7 +667,6 @@ mod tests {
                 meta: None,
                 name: Cow::Borrowed("requires_params"),
                 arguments: Some(Default::default()),
-                task: None,
                 input_responses: None,
                 request_state: None,
             },
@@ -711,7 +710,6 @@ mod tests {
                 meta: None,
                 name: Cow::Borrowed("test_tool"),
                 arguments: None,
-                task: None,
                 input_responses: None,
                 request_state: None,
             },

@@ -1,10 +1,13 @@
 use rmcp::{
-    ClientHandler, ErrorData, RoleClient, ServiceExt,
+    ClientHandler, ClientLifecycleMode, ClientServiceExt, ErrorData, RoleClient, ServiceExt,
     model::*,
-    service::{RequestContext, serve_directly},
+    service::RequestContext,
     transport::{
         AuthClient, AuthorizationManager, StreamableHttpClientTransport,
-        auth::{AuthorizationCallback, OAuthState},
+        auth::{
+            AuthorizationCallback, AuthorizationRequest, ClientCredentialsConfig,
+            InMemoryCredentialStore, JwtSigningAlgorithm, OAuthState,
+        },
         streamable_http_client::StreamableHttpClientTransportConfig,
     },
 };
@@ -14,7 +17,16 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 // ─── Context parsed from MCP_CONFORMANCE_CONTEXT ────────────────────────────
 
 #[derive(Debug, Default, serde::Deserialize)]
+struct ConformanceToolCall {
+    name: String,
+    #[serde(default)]
+    arguments: Option<serde_json::Map<String, Value>>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
 struct ConformanceContext {
+    #[serde(default, alias = "toolCalls")]
+    tool_calls: Vec<ConformanceToolCall>,
     #[serde(default)]
     client_id: Option<String>,
     #[serde(default)]
@@ -180,6 +192,7 @@ impl ClientHandler for FullClientHandler {
 
 const CIMD_CLIENT_METADATA_URL: &str = "https://conformance-test.local/client-metadata.json";
 const REDIRECT_URI: &str = "http://localhost:3000/callback";
+const SCOPE_STEP_UP_INITIAL_SCOPES: &[&str] = &["mcp:basic"];
 const SCOPE_STEP_UP_ESCALATED_SCOPES: &[&str] = &["mcp:basic", "mcp:write"];
 
 /// Perform the headless OAuth authorization-code flow.
@@ -196,11 +209,10 @@ async fn perform_oauth_flow(
 
     // Discover + register + get auth URL
     oauth
-        .start_authorization_with_metadata_url(
-            &[],
-            REDIRECT_URI,
-            Some("conformance-client"),
-            Some(CIMD_CLIENT_METADATA_URL),
+        .start_authorization(
+            AuthorizationRequest::new(REDIRECT_URI)
+                .with_client_name("conformance-client")
+                .with_client_metadata_url(CIMD_CLIENT_METADATA_URL),
         )
         .await?;
 
@@ -236,50 +248,38 @@ async fn perform_oauth_flow(
     Ok(AuthClient::new(reqwest::Client::default(), am))
 }
 
-/// Like `perform_oauth_flow` but uses pre-registered client credentials.
+/// Like `perform_oauth_flow` but uses pre-registered client credentials,
+/// exercising the SDK's high-level `OAuthState` path (no DCR).
 async fn perform_oauth_flow_preregistered(
     server_url: &str,
     client_id: &str,
     client_secret: &str,
 ) -> anyhow::Result<AuthClient<reqwest::Client>> {
-    let mut manager = AuthorizationManager::new(server_url).await?;
-    let metadata = manager.discover_metadata().await?;
-    manager.set_metadata(metadata);
+    let mut oauth = OAuthState::new(server_url, None).await?;
 
-    // Configure with pre-registered credentials
-    let config = rmcp::transport::auth::OAuthClientConfig::new(client_id, REDIRECT_URI)
-        .with_client_secret(client_secret);
-    manager.configure_client(config)?;
+    oauth
+        .start_authorization(
+            AuthorizationRequest::new(REDIRECT_URI)
+                .with_preregistered_client(client_id)
+                .with_client_secret(client_secret),
+        )
+        .await?;
 
-    let scopes = manager.select_scopes(None, &[]);
-    let scope_refs: Vec<&str> = scopes.iter().map(|s| s.as_str()).collect();
-    let auth_url = manager.get_authorization_url(&scope_refs).await?;
+    let auth_url = oauth.get_authorization_url().await?;
+    let callback = headless_authorize(&auth_url).await?;
+    oauth
+        .handle_callback_with_issuer(
+            &callback.code,
+            &callback.csrf_token,
+            callback.issuer.as_deref(),
+        )
+        .await?;
 
-    // Headless redirect
-    let http = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
-    let resp = http.get(&auth_url).send().await?;
-    let location = resp
-        .headers()
-        .get("location")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| anyhow::anyhow!("No Location header"))?;
-    let redirect_url = url::Url::parse(location)?;
-    let code = redirect_url
-        .query_pairs()
-        .find(|(k, _)| k == "code")
-        .map(|(_, v)| v.to_string())
-        .ok_or_else(|| anyhow::anyhow!("No code"))?;
-    let state = redirect_url
-        .query_pairs()
-        .find(|(k, _)| k == "state")
-        .map(|(_, v)| v.to_string())
-        .ok_or_else(|| anyhow::anyhow!("No state"))?;
+    let am = oauth
+        .into_authorization_manager()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get authorization manager"))?;
 
-    manager.exchange_code_for_token(&code, &state).await?;
-
-    Ok(AuthClient::new(reqwest::Client::default(), manager))
+    Ok(AuthClient::new(reqwest::Client::default(), am))
 }
 
 /// Run the standard auth flow, then connect and exercise the server.
@@ -291,7 +291,17 @@ async fn run_auth_client(server_url: &str, ctx: &ConformanceContext) -> anyhow::
         StreamableHttpClientTransportConfig::with_uri(server_url),
     );
 
-    let client = BasicClientHandler.serve(transport).await?;
+    // The 2026-07-28 auth mocks require the modern per-request lifecycle
+    // (MCP-Protocol-Version header on every request), so negotiate via the
+    // discover lifecycle rather than the legacy initialize handshake.
+    let client = BasicClientHandler
+        .serve_with_lifecycle(
+            transport,
+            ClientLifecycleMode::Discover {
+                preferred_versions: preferred_protocol_versions(),
+            },
+        )
+        .await?;
     tracing::debug!("Connected (authenticated)");
 
     let tools = client.list_tools(Default::default()).await?;
@@ -315,14 +325,13 @@ async fn run_auth_scope_step_up_client(
     server_url: &str,
     _ctx: &ConformanceContext,
 ) -> anyhow::Result<()> {
-    // First auth
     let mut oauth = OAuthState::new(server_url, None).await?;
     oauth
-        .start_authorization_with_metadata_url(
-            &[],
-            REDIRECT_URI,
-            Some("conformance-client"),
-            Some(CIMD_CLIENT_METADATA_URL),
+        .start_authorization(
+            AuthorizationRequest::new(REDIRECT_URI)
+                .with_scopes(SCOPE_STEP_UP_INITIAL_SCOPES.iter().copied())
+                .with_client_name("conformance-client")
+                .with_client_metadata_url(CIMD_CLIENT_METADATA_URL),
         )
         .await?;
 
@@ -346,7 +355,9 @@ async fn run_auth_scope_step_up_client(
         StreamableHttpClientTransportConfig::with_uri(server_url),
     );
 
-    let client = BasicClientHandler.serve(transport).await?;
+    let client = BasicClientHandler
+        .serve_with_lifecycle(transport, conformance_lifecycle())
+        .await?;
 
     let tools = client.list_tools(Default::default()).await?;
     tracing::debug!("Listed {} tools", tools.tools.len());
@@ -368,11 +379,11 @@ async fn run_auth_scope_step_up_client(
 
                 let mut oauth2 = OAuthState::new(server_url, None).await?;
                 oauth2
-                    .start_authorization_with_metadata_url(
-                        SCOPE_STEP_UP_ESCALATED_SCOPES,
-                        REDIRECT_URI,
-                        Some("conformance-client"),
-                        Some(CIMD_CLIENT_METADATA_URL),
+                    .start_authorization(
+                        AuthorizationRequest::new(REDIRECT_URI)
+                            .with_scopes(SCOPE_STEP_UP_ESCALATED_SCOPES.iter().copied())
+                            .with_client_name("conformance-client")
+                            .with_client_metadata_url(CIMD_CLIENT_METADATA_URL),
                     )
                     .await?;
                 let auth_url2 = oauth2.get_authorization_url().await?;
@@ -393,10 +404,12 @@ async fn run_auth_scope_step_up_client(
                     auth_client2,
                     StreamableHttpClientTransportConfig::with_uri(server_url),
                 );
-                let client2 = BasicClientHandler.serve(transport2).await?;
-                let _ = client2
+                let client2 = BasicClientHandler
+                    .serve_with_lifecycle(transport2, conformance_lifecycle())
+                    .await?;
+                client2
                     .call_tool(call_tool_params(tool.name.clone(), args))
-                    .await;
+                    .await?;
                 client2.cancel().await.ok();
                 return Ok(());
             }
@@ -418,11 +431,10 @@ async fn run_auth_scope_retry_limit_client(
     loop {
         let mut oauth = OAuthState::new(server_url, None).await?;
         oauth
-            .start_authorization_with_metadata_url(
-                &[],
-                REDIRECT_URI,
-                Some("conformance-client"),
-                Some(CIMD_CLIENT_METADATA_URL),
+            .start_authorization(
+                AuthorizationRequest::new(REDIRECT_URI)
+                    .with_client_name("conformance-client")
+                    .with_client_metadata_url(CIMD_CLIENT_METADATA_URL),
             )
             .await?;
         let auth_url = oauth.get_authorization_url().await?;
@@ -486,6 +498,66 @@ async fn run_auth_scope_retry_limit_client(
     Ok(())
 }
 
+async fn migration_token(
+    server_url: &str,
+    store: &InMemoryCredentialStore,
+) -> anyhow::Result<String> {
+    let mut manager = AuthorizationManager::new(server_url).await?;
+    manager.set_credential_store(store.clone());
+
+    if manager.initialize_from_store().await? {
+        return Ok(manager.get_access_token().await?);
+    }
+
+    let resolution = manager.resolve_metadata().await?;
+    manager.set_metadata(resolution.metadata);
+    manager
+        .register_client("conformance-client", REDIRECT_URI, &[])
+        .await?;
+
+    let scopes = manager.select_scopes(None, &[]);
+    let scope_refs: Vec<&str> = scopes.iter().map(|s| s.as_str()).collect();
+    let auth_url = manager.get_authorization_url(&scope_refs).await?;
+    let callback = headless_authorize(&auth_url).await?;
+    manager
+        .exchange_code_for_token_with_issuer(
+            &callback.code,
+            &callback.csrf_token,
+            callback.issuer.as_deref(),
+        )
+        .await?;
+
+    Ok(manager.get_access_token().await?)
+}
+
+async fn run_auth_server_migration_client(
+    server_url: &str,
+    _ctx: &ConformanceContext,
+) -> anyhow::Result<()> {
+    let store = InMemoryCredentialStore::new();
+    let http = reqwest::Client::new();
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}});
+
+    let mut token = migration_token(server_url, &store).await?;
+    for _ in 0..3 {
+        let resp = http
+            .post(server_url)
+            .header(
+                "MCP-Protocol-Version",
+                conformance_protocol_version().as_str(),
+            )
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            token = migration_token(server_url, &store).await?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Auth flow with pre-registered credentials (from context).
 async fn run_auth_preregistered_client(
     server_url: &str,
@@ -537,9 +609,9 @@ async fn run_client_credentials_basic(
         .unwrap_or("conformance-test-secret");
 
     let mut manager = AuthorizationManager::new(server_url).await?;
-    let metadata = manager.discover_metadata().await?;
-    let token_endpoint = metadata.token_endpoint.clone();
-    manager.set_metadata(metadata);
+    let resolution = manager.resolve_metadata().await?;
+    let token_endpoint = resolution.metadata.token_endpoint.clone();
+    manager.set_metadata(resolution.metadata);
 
     let http = reqwest::Client::new();
     let resp = http
@@ -582,49 +654,43 @@ async fn run_client_credentials_jwt(
 ) -> anyhow::Result<()> {
     let client_id = ctx
         .client_id
-        .as_deref()
-        .unwrap_or("conformance-test-client");
-    let _pem = ctx
+        .clone()
+        .unwrap_or_else(|| "conformance-test-client".to_string());
+    let signing_key = ctx
         .private_key_pem
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("Missing private_key_pem"))?;
-    let _alg = ctx
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Missing private_key_pem"))?
+        .as_bytes()
+        .to_vec();
+    let signing_algorithm = match ctx
         .signing_algorithm
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("Missing signing_algorithm"))?;
-
-    // Discover metadata to get token endpoint
-    let mut manager = AuthorizationManager::new(server_url).await?;
-    let metadata = manager.discover_metadata().await?;
-    let token_endpoint = metadata.token_endpoint.clone();
-    manager.set_metadata(metadata);
-
-    // Build JWT assertion
-    // Parse the PEM private key
-    let key = openssl_free_ec_sign(_pem, client_id, &token_endpoint)?;
-
-    let http = reqwest::Client::new();
-    let form_body = format!(
-        "grant_type=client_credentials&client_assertion_type={}&client_assertion={}",
-        urlencoding::encode("urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
-        urlencoding::encode(&key),
-    );
-    let resp = http
-        .post(&token_endpoint)
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(form_body)
-        .send()
-        .await?;
-
-    let token_resp: serde_json::Value = resp.json().await?;
-    let access_token = token_resp["access_token"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("No access_token: {}", token_resp))?;
+        .ok_or_else(|| anyhow::anyhow!("Missing signing_algorithm"))?
+    {
+        "RS256" => JwtSigningAlgorithm::RS256,
+        "RS384" => JwtSigningAlgorithm::RS384,
+        "RS512" => JwtSigningAlgorithm::RS512,
+        "ES256" => JwtSigningAlgorithm::ES256,
+        "ES384" => JwtSigningAlgorithm::ES384,
+        algorithm => anyhow::bail!("Unsupported signing_algorithm: {algorithm}"),
+    };
+    let config = ClientCredentialsConfig::PrivateKeyJwt {
+        client_id,
+        signing_key,
+        signing_algorithm,
+        token_endpoint_audience: None,
+        scopes: vec![],
+        resource: Some(server_url.to_string()),
+    };
+    let mut oauth_state = OAuthState::new(server_url, None).await?;
+    oauth_state.authenticate_client_credentials(config).await?;
+    let manager = oauth_state
+        .into_authorization_manager()
+        .ok_or_else(|| anyhow::anyhow!("Client credentials flow did not authorize"))?;
 
     let transport = StreamableHttpClientTransport::with_client(
-        reqwest::Client::default(),
-        StreamableHttpClientTransportConfig::with_uri(server_url)
-            .auth_header(access_token.to_string()),
+        AuthClient::new(reqwest::Client::default(), manager),
+        StreamableHttpClientTransportConfig::with_uri(server_url),
     );
 
     let client = BasicClientHandler.serve(transport).await?;
@@ -638,73 +704,6 @@ async fn run_client_credentials_jwt(
     }
     client.cancel().await?;
     Ok(())
-}
-
-/// Minimal ES256 JWT signing without heavy deps.
-/// We use ring or pure-Rust approach. For simplicity, use the p256 + base64 crates
-/// that are already transitive deps of oauth2.
-fn openssl_free_ec_sign(pem: &str, client_id: &str, audience: &str) -> anyhow::Result<String> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    // Decode PEM → DER
-    let pem_body = pem
-        .lines()
-        .filter(|l| !l.starts_with("-----"))
-        .collect::<String>();
-    let der = base64_decode(&pem_body)?;
-
-    // Parse PKCS#8 DER to get the raw EC private key bytes
-    // PKCS#8 for EC P-256: the raw 32-byte key is at the end of the structure
-    let raw_key = extract_ec_private_key(&der)?;
-
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let header = base64url_encode(br#"{"alg":"ES256","typ":"JWT"}"#);
-    let payload_json = serde_json::json!({
-        "iss": client_id,
-        "sub": client_id,
-        "aud": audience,
-        "iat": now,
-        "exp": now + 300,
-        "jti": format!("jti-{}", now),
-    });
-    let payload = base64url_encode(payload_json.to_string().as_bytes());
-    let signing_input = format!("{}.{}", header, payload);
-
-    // Sign with p256
-    let secret_key = p256::ecdsa::SigningKey::from_slice(raw_key.as_slice())
-        .map_err(|e| anyhow::anyhow!("Invalid EC key: {}", e))?;
-    use p256::ecdsa::signature::Signer;
-    let sig: p256::ecdsa::Signature = secret_key.sign(signing_input.as_bytes());
-    let sig_bytes = sig.to_bytes();
-    let sig_b64 = base64url_encode(&sig_bytes);
-
-    Ok(format!("{}.{}", signing_input, sig_b64))
-}
-
-fn base64url_encode(data: &[u8]) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data)
-}
-
-fn base64_decode(s: &str) -> anyhow::Result<Vec<u8>> {
-    use base64::Engine;
-    Ok(base64::engine::general_purpose::STANDARD.decode(s.trim())?)
-}
-
-/// Extract the raw 32-byte EC private key from a PKCS#8 DER blob.
-fn extract_ec_private_key(der: &[u8]) -> anyhow::Result<Vec<u8>> {
-    // PKCS#8 wraps an ECPrivateKey. We look for the octet string containing
-    // the 32-byte private key. A simple heuristic: find 0x04 0x20 (OCTET STRING, len 32)
-    // followed by exactly 32 bytes that form the key.
-    // More robust: parse ASN.1. But for conformance testing this suffices.
-    for i in 0..der.len().saturating_sub(33) {
-        if der[i] == 0x04 && der[i + 1] == 0x20 && i + 34 <= der.len() {
-            return Ok(der[i + 2..i + 34].to_vec());
-        }
-    }
-    Err(anyhow::anyhow!(
-        "Could not extract 32-byte EC private key from PKCS#8 DER"
-    ))
 }
 
 /// Cross-app access flow (SEP-1046 extension).
@@ -793,16 +792,53 @@ async fn run_basic_client(server_url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_tools_call_client(server_url: &str) -> anyhow::Result<()> {
+async fn run_tools_call_client(server_url: &str, ctx: &ConformanceContext) -> anyhow::Result<()> {
+    run_tools_call_client_with_lifecycle(server_url, ctx, conformance_lifecycle()).await
+}
+
+async fn run_discover_tools_call_client(
+    server_url: &str,
+    ctx: &ConformanceContext,
+) -> anyhow::Result<()> {
+    run_tools_call_client_with_lifecycle(
+        server_url,
+        ctx,
+        ClientLifecycleMode::Discover {
+            preferred_versions: preferred_protocol_versions(),
+        },
+    )
+    .await
+}
+
+async fn run_tools_call_client_with_lifecycle(
+    server_url: &str,
+    ctx: &ConformanceContext,
+    lifecycle: ClientLifecycleMode,
+) -> anyhow::Result<()> {
     let transport = StreamableHttpClientTransport::from_uri(server_url);
-    let client = FullClientHandler.serve(transport).await?;
+    let client = FullClientHandler
+        .serve_with_lifecycle(transport, lifecycle)
+        .await?;
     let tools = client.list_tools(Default::default()).await?;
-    for tool in &tools.tools {
-        let args = build_tool_arguments(tool);
-        let _ = client
-            .call_tool(call_tool_params(tool.name.clone(), args))
-            .await?;
+
+    if ctx.tool_calls.is_empty() {
+        for tool in &tools.tools {
+            let args = build_tool_arguments(tool);
+            client
+                .call_tool(call_tool_params(tool.name.clone(), args))
+                .await?;
+        }
+    } else {
+        for tool_call in &ctx.tool_calls {
+            client
+                .call_tool(call_tool_params(
+                    tool_call.name.clone().into(),
+                    tool_call.arguments.clone(),
+                ))
+                .await?;
+        }
     }
+
     client.cancel().await?;
     Ok(())
 }
@@ -824,84 +860,46 @@ async fn run_elicitation_defaults_client(server_url: &str) -> anyhow::Result<()>
     Ok(())
 }
 
-/// A minimal stateless client transport: every outgoing message is one HTTP
-/// POST and the JSON response body (if any) is queued for `receive()`.
-///
-/// The SEP-2322 client scenario's mock server speaks the stateless lifecycle
-/// (no `initialize` handshake, plain JSON responses), which the session-based
-/// `StreamableHttpClientTransport` cannot do. The transport is harness
-/// plumbing; the behavior under test — the SDK's MRTR retry driver — runs
-/// unchanged on top of it.
-struct StatelessHttpTransport {
-    http: reqwest::Client,
-    uri: std::sync::Arc<str>,
-    tx: tokio::sync::mpsc::Sender<ServerJsonRpcMessage>,
-    rx: tokio::sync::mpsc::Receiver<ServerJsonRpcMessage>,
+fn conformance_protocol_version() -> ProtocolVersion {
+    std::env::var("MCP_CONFORMANCE_PROTOCOL_VERSION")
+        .ok()
+        .and_then(|version| serde_json::from_value(Value::String(version)).ok())
+        .unwrap_or(ProtocolVersion::V_2025_11_25)
 }
 
-impl StatelessHttpTransport {
-    fn new(uri: &str) -> Self {
-        let (tx, rx) = tokio::sync::mpsc::channel(16);
-        Self {
-            http: reqwest::Client::new(),
-            uri: uri.into(),
-            tx,
-            rx,
+fn conformance_lifecycle() -> ClientLifecycleMode {
+    if conformance_protocol_version().as_str() >= ProtocolVersion::V_2026_07_28.as_str() {
+        ClientLifecycleMode::Discover {
+            preferred_versions: preferred_protocol_versions(),
+        }
+    } else {
+        ClientLifecycleMode::Initialize
+    }
+}
+
+/// Preferred protocol versions for discover-lifecycle negotiation: the
+/// runner-provided version first, then all other known versions newest-first.
+fn preferred_protocol_versions() -> Vec<ProtocolVersion> {
+    let mut preferred_versions = vec![conformance_protocol_version()];
+    for version in ProtocolVersion::KNOWN_VERSIONS.iter().rev() {
+        if !preferred_versions.contains(version) {
+            preferred_versions.push(version.clone());
         }
     }
+    preferred_versions
 }
 
-impl rmcp::transport::Transport<RoleClient> for StatelessHttpTransport {
-    type Error = std::io::Error;
-
-    fn send(
-        &mut self,
-        item: rmcp::model::ClientJsonRpcMessage,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + 'static {
-        let http = self.http.clone();
-        let uri = self.uri.clone();
-        let tx = self.tx.clone();
-        async move {
-            let response = http
-                .post(uri.as_ref())
-                .header("MCP-Protocol-Version", "2026-07-28")
-                .json(&item)
-                .send()
-                .await
-                .map_err(std::io::Error::other)?;
-            match response.json::<ServerJsonRpcMessage>().await {
-                Ok(message) => {
-                    let _ = tx.send(message).await;
-                }
-                Err(_) => {
-                    // No JSON-RPC body (e.g. 202/204 for notifications).
-                }
-            }
-            Ok(())
-        }
-    }
-
-    async fn receive(&mut self) -> Option<ServerJsonRpcMessage> {
-        self.rx.recv().await
-    }
-
-    async fn close(&mut self) -> Result<(), Self::Error> {
-        Ok(())
-    }
-}
-
-/// A stateless-lifecycle client: the scenario's server has no `initialize`
-/// handler, so skip the handshake with `serve_directly`, list the tools, and
-/// call each one via the high-level `call_tool` helper (which drives SEP-2322
-/// `input_required` retry rounds when the server requests them). Used by the
-/// `sep-2322-client-request-state` scenario, whose mock server verifies
-/// requestState echo, fresh JSON-RPC ids on retry, state omission, isolation
-/// between tools, and the `resultType` default.
-async fn run_stateless_client(server_url: &str) -> anyhow::Result<()> {
-    let transport = StatelessHttpTransport::new(server_url);
-    let peer_info = InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
-        .with_protocol_version(ProtocolVersion::V_2026_07_28);
-    let client = serve_directly(FullClientHandler, transport, Some(peer_info));
+/// Runs draft stateless scenarios through the public discover lifecycle and
+/// Streamable HTTP transport.
+async fn run_discover_client(server_url: &str) -> anyhow::Result<()> {
+    let preferred_versions = preferred_protocol_versions();
+    let transport = StreamableHttpClientTransport::from_uri(server_url);
+    let client = FullClientHandler
+        .serve_with_lifecycle(
+            transport,
+            ClientLifecycleMode::Discover { preferred_versions },
+        )
+        .await?;
 
     let tools = client.list_tools(Default::default()).await?;
     tracing::debug!("Listed {} tools", tools.tools.len());
@@ -952,15 +950,50 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Running scenario '{}' against {}", scenario, server_url);
 
-    match scenario.as_str() {
+    // Safety net: some harness servers intentionally misbehave (e.g. reply
+    // with an id-less error instead of answering a request), which would
+    // leave the client waiting forever. Exit on our own before the harness's
+    // 30s client timeout so it never has to kill us (which has been observed
+    // to wedge the harness process in CI).
+    let timeout_secs: u64 = std::env::var("MCP_CONFORMANCE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(25);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        run_scenario(&scenario, &server_url, &ctx),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Scenario '{scenario}' timed out after {timeout_secs}s"))??;
+
+    Ok(())
+}
+
+async fn run_scenario(
+    scenario: &str,
+    server_url: &str,
+    ctx: &ConformanceContext,
+) -> anyhow::Result<()> {
+    match scenario {
         // Non-auth scenarios
-        "initialize" => run_basic_client(&server_url).await?,
-        "tools_call" => run_tools_call_client(&server_url).await?,
+        "initialize" => run_basic_client(server_url).await?,
+        // SEP-2106: the scenario serves a tool whose schema carries a network
+        // `$ref`; the check passes when the client lists tools without
+        // dereferencing (fetching) that URL. A plain connect → list_tools →
+        // close is sufficient; the scenario's mock server does not implement
+        // the discover lifecycle, so `run_discover_client` hangs against it.
+        "json-schema-ref-no-deref" => run_basic_client(server_url).await?,
+        "tools_call" => run_tools_call_client(server_url, ctx).await?,
         "elicitation-sep1034-client-defaults" => {
-            run_elicitation_defaults_client(&server_url).await?
+            run_elicitation_defaults_client(server_url).await?
         }
-        "sse-retry" => run_sse_retry_client(&server_url).await?,
-        "sep-2322-client-request-state" => run_stateless_client(&server_url).await?,
+        "sse-retry" => run_sse_retry_client(server_url).await?,
+        "request-metadata" | "sep-2322-client-request-state" => {
+            run_discover_client(server_url).await?
+        }
+        "http-standard-headers" | "http-custom-headers" | "http-invalid-tool-headers" => {
+            run_discover_tools_call_client(server_url, ctx).await?
+        }
 
         // Auth scenarios - standard OAuth flow
         "auth/metadata-default"
@@ -975,21 +1008,42 @@ async fn main() -> anyhow::Result<()> {
         | "auth/token-endpoint-auth-post"
         | "auth/token-endpoint-auth-none"
         | "auth/2025-03-26-oauth-metadata-backcompat"
-        | "auth/2025-03-26-oauth-endpoint-fallback" => run_auth_client(&server_url, &ctx).await?,
+        | "auth/2025-03-26-oauth-endpoint-fallback"
+        // Offline access scope handling: positive/negative variants both run
+        // the well-behaved flow; the referee inspects the requested scopes.
+        | "auth/offline-access-scope"
+        | "auth/offline-access-not-supported"
+        // SEP-2468 (RFC 9207 iss / RFC 8414 §3.3 issuer-echo). The client
+        // captures `iss` from the authorization redirect and passes it to the
+        // callback handler; the SDK validates internally. Positive scenarios
+        // proceed to the token endpoint; negative scenarios error out (the
+        // referee sets `allowClientError`).
+        | "auth/iss-supported"
+        | "auth/iss-not-advertised"
+        | "auth/iss-supported-missing"
+        | "auth/iss-wrong-issuer"
+        | "auth/iss-unexpected"
+        | "auth/iss-normalized"
+        | "auth/metadata-issuer-mismatch" => run_auth_client(server_url, ctx).await?,
 
         // Auth - scope step-up
-        "auth/scope-step-up" => run_auth_scope_step_up_client(&server_url, &ctx).await?,
+        "auth/scope-step-up" => run_auth_scope_step_up_client(server_url, ctx).await?,
 
         // Auth - scope retry limit
-        "auth/scope-retry-limit" => run_auth_scope_retry_limit_client(&server_url, &ctx).await?,
+        "auth/scope-retry-limit" => run_auth_scope_retry_limit_client(server_url, ctx).await?,
+
+        // Auth - authorization server migration (SEP-2352)
+        "auth/authorization-server-migration" => {
+            run_auth_server_migration_client(server_url, ctx).await?
+        }
 
         // Auth - pre-registration
-        "auth/pre-registration" => run_auth_preregistered_client(&server_url, &ctx).await?,
+        "auth/pre-registration" => run_auth_preregistered_client(server_url, ctx).await?,
 
         // Auth - resource mismatch (should fail to auth → pass)
         "auth/resource-mismatch" => {
             // Try to auth; it should fail because PRM resource doesn't match
-            match run_auth_client(&server_url, &ctx).await {
+            match run_auth_client(server_url, ctx).await {
                 Ok(_) => {
                     tracing::warn!("Auth succeeded despite resource mismatch!");
                 }
@@ -1000,25 +1054,43 @@ async fn main() -> anyhow::Result<()> {
         }
 
         // Auth - client credentials
-        "auth/client-credentials-basic" => run_client_credentials_basic(&server_url, &ctx).await?,
-        "auth/client-credentials-jwt" => run_client_credentials_jwt(&server_url, &ctx).await?,
+        "auth/client-credentials-basic" => run_client_credentials_basic(server_url, ctx).await?,
+        "auth/client-credentials-jwt" => run_client_credentials_jwt(server_url, ctx).await?,
 
         // Auth - cross-app access
         "auth/cross-app-access-complete-flow" => {
-            run_cross_app_access_client(&server_url, &ctx).await?
+            run_cross_app_access_client(server_url, ctx).await?
         }
 
-        _ => {
-            tracing::warn!("Unknown scenario '{}', trying auth flow", scenario);
-            match run_auth_client(&server_url, &ctx).await {
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::debug!("Auth flow failed for unknown scenario: {e}");
-                    run_basic_client(&server_url).await?
-                }
-            }
-        }
+        unknown => anyhow::bail!("Unsupported conformance scenario: {unknown}"),
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conformance_context_accepts_camel_case_tool_calls() {
+        let context: ConformanceContext = serde_json::from_value(json!({
+            "toolCalls": [{
+                "name": "test_custom_headers",
+                "arguments": { "region": "us-west1" }
+            }]
+        }))
+        .expect("valid conformance context");
+
+        assert_eq!(
+            context.tool_calls.first().map(|tool_call| (
+                tool_call.name.as_str(),
+                tool_call
+                    .arguments
+                    .as_ref()
+                    .and_then(|arguments| arguments.get("region")),
+            )),
+            Some(("test_custom_headers", Some(&json!("us-west1"))))
+        );
+    }
 }

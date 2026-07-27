@@ -42,8 +42,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
-    CallToolResult, CreateMessageRequest, ElicitRequest, GetPromptResult, ListRootsRequest, Meta,
-    ReadResourceResult, ResultType, ServerResult,
+    CallToolResult, CreateMessageRequest, CreateTaskResult, ElicitRequest, GetPromptResult,
+    ListRootsRequest, MetaObject, ReadResourceResult, ResultType, ServerResult,
 };
 
 /// Default maximum number of MRTR rounds a high-level client call will drive.
@@ -72,6 +72,18 @@ pub enum InputRequest {
     ListRoots(ListRootsRequest),
 }
 
+// Wire-level equality: two `InputRequest`s are equal if they serialize to the
+// same JSON. The wrapped request envelopes do not implement `PartialEq`
+// structurally (they carry `Extensions`).
+impl PartialEq for InputRequest {
+    fn eq(&self, other: &Self) -> bool {
+        match (serde_json::to_value(self), serde_json::to_value(other)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
 /// A map of server-initiated requests that the client must fulfill.
 ///
 /// Keys are server-assigned string identifiers; values are request objects
@@ -95,6 +107,9 @@ pub enum CallToolResponse {
     Complete(CallToolResult),
     /// The server requires client-side input before the tool call can complete.
     InputRequired(InputRequiredResult),
+    /// The server materialized a task for this call (SEP-2663 Tasks extension,
+    /// `resultType: "task"`). The client polls `tasks/get` for the result.
+    Task(CreateTaskResult),
 }
 
 impl From<CallToolResult> for CallToolResponse {
@@ -114,7 +129,14 @@ impl From<CallToolResponse> for ServerResult {
         match response {
             CallToolResponse::Complete(result) => ServerResult::CallToolResult(result),
             CallToolResponse::InputRequired(result) => ServerResult::InputRequiredResult(result),
+            CallToolResponse::Task(result) => ServerResult::CreateTaskResult(result),
         }
+    }
+}
+
+impl From<CreateTaskResult> for CallToolResponse {
+    fn from(result: CreateTaskResult) -> Self {
+        Self::Task(result)
     }
 }
 
@@ -220,7 +242,7 @@ pub struct InputRequiredResult {
 
     /// Optional protocol-level metadata.
     #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
-    pub meta: Option<Meta>,
+    pub meta: Option<MetaObject>,
 }
 
 /// Custom deserializer that requires `resultType: "input_required"` to prevent
@@ -238,7 +260,7 @@ impl<'de> Deserialize<'de> for InputRequiredResult {
             input_requests: Option<InputRequests>,
             request_state: Option<String>,
             #[serde(rename = "_meta")]
-            meta: Option<Meta>,
+            meta: Option<MetaObject>,
         }
 
         let helper = Helper::deserialize(deserializer)?;
@@ -283,7 +305,7 @@ impl InputRequiredResult {
     }
 
     /// Sets optional metadata.
-    pub fn with_meta(mut self, meta: Meta) -> Self {
+    pub fn with_meta(mut self, meta: MetaObject) -> Self {
         self.meta = Some(meta);
         self
     }
