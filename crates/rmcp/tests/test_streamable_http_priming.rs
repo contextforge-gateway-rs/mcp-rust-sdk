@@ -1,14 +1,147 @@
 #![cfg(not(feature = "local"))]
-use std::time::Duration;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
-use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService,
-    session::{SessionId, local::LocalSessionManager},
+use rmcp::{
+    ErrorData, RoleServer, ServerHandler,
+    model::{InitializeRequestParams, InitializeResult, ServerCapabilities},
+    service::RequestContext,
+    transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService,
+        session::{SessionId, local::LocalSessionManager},
+        tower::DownstreamSessionId,
+    },
 };
 use tokio_util::sync::CancellationToken;
 
 mod common;
 use common::calculator::Calculator;
+
+#[derive(Clone, Default)]
+struct SessionIdRecorder {
+    session_id: Arc<Mutex<Option<String>>>,
+}
+
+impl ServerHandler for SessionIdRecorder {
+    async fn initialize(
+        &self,
+        _request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, ErrorData> {
+        let session_id = context
+            .extensions
+            .get::<DownstreamSessionId>()
+            .ok_or_else(|| ErrorData::internal_error("missing downstream session ID", None))?;
+        *self
+            .session_id
+            .lock()
+            .expect("session ID recorder lock poisoned") = Some(session_id.value().to_owned());
+        Ok(InitializeResult::new(ServerCapabilities::default()))
+    }
+}
+
+#[tokio::test]
+async fn legacy_initialize_propagates_generated_session_id_to_handler() -> anyhow::Result<()> {
+    let ct = CancellationToken::new();
+    let recorder = SessionIdRecorder::default();
+    let observed_session_id = Arc::clone(&recorder.session_id);
+    let service: StreamableHttpService<SessionIdRecorder, LocalSessionManager> =
+        StreamableHttpService::new(
+            move || Ok(recorder.clone()),
+            Default::default(),
+            StreamableHttpServerConfig::default()
+                .with_sse_keep_alive(None)
+                .with_cancellation_token(ct.child_token()),
+        );
+
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = tcp_listener.local_addr()?;
+    let handle = tokio::spawn({
+        let ct = ct.clone();
+        async move {
+            let _ = axum::serve(tcp_listener, router)
+                .with_graceful_shutdown(async move { ct.cancelled_owned().await })
+                .await;
+        }
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#)
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), 200);
+    let response_session_id = response.headers()["mcp-session-id"].to_str()?.to_owned();
+    let _body = response.text().await?;
+    let handler_session_id = observed_session_id
+        .lock()
+        .expect("session ID recorder lock poisoned")
+        .clone()
+        .expect("initialize handler recorded session ID");
+    assert_eq!(handler_session_id, response_session_id);
+
+    ct.cancel();
+    handle.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn modern_initialize_exposes_routing_id_without_creating_rmcp_session() -> anyhow::Result<()>
+{
+    let ct = CancellationToken::new();
+    let recorder = SessionIdRecorder::default();
+    let observed_session_id = Arc::clone(&recorder.session_id);
+    let session_manager = Arc::new(LocalSessionManager::default());
+    let service = StreamableHttpService::new(
+        move || Ok(recorder.clone()),
+        Arc::clone(&session_manager),
+        StreamableHttpServerConfig::default()
+            .with_json_response(true)
+            .with_sse_keep_alive(None)
+            .with_cancellation_token(ct.child_token()),
+    );
+
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = tcp_listener.local_addr()?;
+    let handle = tokio::spawn({
+        let ct = ct.clone();
+        async move {
+            let _ = axum::serve(tcp_listener, router)
+                .with_graceful_shutdown(async move { ct.cancelled_owned().await })
+                .await;
+        }
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2026-07-28","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#)
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), 200);
+    let response_session_id = response.headers()["mcp-session-id"].to_str()?.to_owned();
+    let _body = response.text().await?;
+    let handler_session_id = observed_session_id
+        .lock()
+        .expect("session ID recorder lock poisoned")
+        .clone()
+        .expect("initialize handler recorded downstream routing ID");
+    assert_eq!(handler_session_id, response_session_id);
+    assert!(session_manager.sessions.read().await.is_empty());
+
+    ct.cancel();
+    handle.await?;
+    Ok(())
+}
 
 #[tokio::test]
 async fn test_priming_on_stream_start() -> anyhow::Result<()> {
